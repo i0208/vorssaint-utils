@@ -21,7 +21,15 @@ final class NotchMusicService: ObservableObject {
     @Published private(set) var commandPending = false
     @Published private(set) var automationAvailability: NotchMusicAutomation.Availability?
     @Published private(set) var requestingAutomation = false
-    @Published private(set) var upcoming: NotchQueueSnapshot?
+    @Published private(set) var upcoming: NotchQueueSnapshot? {
+        didSet {
+            guard upcoming != oldValue else { return }
+            queueCovers.update(upcoming, decode: NSImage.init(data:))
+            upcomingArtwork = queueCovers.images
+        }
+    }
+    @Published private(set) var upcomingArtwork: [String: NSImage] = [:]
+    private var queueCovers = NotchQueueCovers<NSImage>()
     @Published private(set) var queueLoading = false
     @Published private(set) var queueActionPending = false
     @Published private(set) var queueActionFailed = false
@@ -119,6 +127,10 @@ final class NotchMusicService: ObservableObject {
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         process.standardInput = input
+        // The adapter's `artworkUnchanged` stands for the player's own last
+        // cover, never one found from a tab or Apple, so a later song that
+        // keeps the same small cover still gets a lookup of its own.
+        var playerArtwork: Data?
         var cachedArtwork: Data?
         var cachedImage: NSImage?
         var cachedTint: NotchArtworkTint?
@@ -146,9 +158,15 @@ final class NotchMusicService: ObservableObject {
                 }
                 return
             }
-            let next = NotchPlayback.decode(data, previousArtwork: cachedArtwork,
+            var next = NotchPlayback.decode(data, previousArtwork: playerArtwork,
                                            commandContext: reply.flatMap(NotchPlaybackContext.init(reply:)),
                                            canSendCommandsDirectly: reply?["canSendCommandsDirectly"] as? Bool == true)
+            playerArtwork = next?.track.artworkData
+            // A cover already found for a Firefox-family browser replaces
+            // the player's missing or small cover before it is decoded.
+            if let playback = next, let cover = NotchBrowserArtwork.shared.artwork(for: playback) {
+                next = playback.withArtwork(cover)
+            }
             if cachedArtwork != next?.track.artworkData {
                 cachedArtwork = next?.track.artworkData
                 cachedImage = cachedArtwork.flatMap { ImageThumbnailer.thumbnail(data: $0, pointSize: 160, scale: 2) }
@@ -162,6 +180,10 @@ final class NotchMusicService: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, self.generation == requested,
                       self.acceptsSourceReply(automatic: automatic, sources: sources) else { return }
+                // A pipe reply may still be decoding when the player stops
+                // or restarts. Only the accepted adapter may start or cancel
+                // a lookup, including while a chosen source is restored.
+                self.requestBrowserArtwork(for: next)
                 self.receive(Reading(playback: next, artwork: image, tint: tint, sources: sources,
                                      automatic: automatic, selectedPID: selectedPID))
             }
@@ -257,6 +279,7 @@ final class NotchMusicService: ObservableObject {
         updateArtwork(reading.artwork, tint: reading.tint, playback: reading.playback)
         playback = reading.playback
         sources = reading.sources
+        NotchPreferredPlayer.remember(reading.playback, in: reading.sources)
         sourceIsAutomatic = reading.automatic ?? true
         selectedSourcePID = reading.selectedPID
         awaitingPlayback = false
@@ -281,6 +304,32 @@ final class NotchMusicService: ObservableObject {
         }
         restartWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(restartCount), execute: work)
+    }
+
+    /// The redraw checks the track playing now, since the adapter can change
+    /// it before this queued update reaches the main thread.
+    private func requestBrowserArtwork(for playback: NotchPlayback?) {
+        NotchBrowserArtwork.shared.request(for: playback) { [weak self] in
+            DispatchQueue.main.async { self?.applyBrowserArtwork() }
+        }
+    }
+
+    /// The option in Settings changed. The adapter replies only when the
+    /// player changes, so the track playing now is looked up, or its lookup
+    /// stops, at once. A song held through a gap gives way to the reading
+    /// that replaces it.
+    func syncBrowserCovers() {
+        requestBrowserArtwork(for: gapWork == nil ? playback : gapReading?.playback)
+    }
+
+    /// The adapter only replies when the player changes, so a cover that
+    /// arrives between replies goes in here for the track still playing.
+    /// `playback` itself stays put, since a changed track would reset a scrub
+    /// in progress. The next reply carries the cover from the lookup anyway.
+    private func applyBrowserArtwork() {
+        guard let playback, let cover = NotchBrowserArtwork.shared.artwork(for: playback),
+              let image = ImageThumbnailer.thumbnail(data: cover, pointSize: 160, scale: 2) else { return }
+        updateArtwork(image, tint: Self.artworkTint(of: image), playback: playback.withArtwork(cover))
     }
 
     private func updateArtwork(_ image: NSImage?, tint: NotchArtworkTint?, playback: NotchPlayback?) {
@@ -347,9 +396,11 @@ final class NotchMusicService: ObservableObject {
         commandWriter.stop()
         queueVisible = false
         NotchLyricsService.shared.hide()
+        NotchBrowserArtwork.shared.cancel()
         queueRequest = nil
         queueReply = nil
         upcoming = nil
+        queueCovers = .init()
         queueLoading = false
         queueActionPending = false
         queueActionFailed = false
@@ -416,7 +467,9 @@ final class NotchMusicService: ObservableObject {
     }
 
     func syncQueuePreference() {
-        if !NotchQueueSupport.isEnabled() { setQueueVisible(false) }
+        guard !NotchQueueSupport.isEnabled() else { return }
+        setQueueVisible(false)
+        queueCovers = .init()
     }
 
     func refreshQueue() {
@@ -432,11 +485,21 @@ final class NotchMusicService: ObservableObject {
         if !send(.queue(request)) { queueLoading = false; queueActionFailed = true }
     }
 
+    var upcomingIsHeld: Bool {
+        guard let upcoming else { return false }
+        return upcoming.currentIdentifier != playback?.itemIdentifier || upcoming.pid != playback?.track.appPID
+    }
+
+    var upcomingRows: [NotchQueueItem] {
+        upcoming?.items.filter { $0.id != playback?.itemIdentifier } ?? []
+    }
+
     func playQueued(_ item: NotchQueueItem) {
         guard queueVisible, NotchQueueSupport.isEnabled(), let request = queueRequest, let upcoming,
               let playback, upcoming.currentIdentifier == playback.itemIdentifier,
               upcoming.pid == playback.track.appPID, upcoming.canPlay,
-              upcoming.items.contains(item), !queueActionPending else { return }
+              upcoming.items.contains(where: { $0.id == item.id && $0.offset == item.offset }),
+              !queueActionPending else { return }
         queueActionFailed = false
         queueActionPending = true
         let selected = NotchQueueSelection(requestID: request, pid: upcoming.pid,
@@ -461,7 +524,10 @@ final class NotchMusicService: ObservableObject {
             upcoming = nil
             return
         }
-        upcoming = NotchQueueSupport.decode(queueReply, requestID: request, playback: playback)
+        let next = NotchQueueSupport.decode(queueReply, requestID: request, playback: playback)
+        if next == nil, upcoming != nil,
+           NotchQueueSupport.awaitsSongQueue(queueReply, requestID: request, playback: playback) { return }
+        upcoming = next
     }
 
     func seek(to position: Double, in track: RadialNowPlayingSnapshot, context: NotchPlaybackContext?) {

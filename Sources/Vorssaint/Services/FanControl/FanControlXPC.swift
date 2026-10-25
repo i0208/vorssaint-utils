@@ -83,6 +83,8 @@ enum FanControlIdentifiers {
 
 enum FanControlIPC {
     static func encode(_ response: FanControlResponse) -> Data {
+        // Every value in this closed response model is JSON encodable. Keeping
+        // one deterministic fallback avoids ever violating the XPC reply shape.
         (try? JSONEncoder().encode(response))
             ?? Data(#"{"succeeded":false,"snapshot":{"fans":[],"isCooling":false},"error":"controlFailed"}"#.utf8)
     }

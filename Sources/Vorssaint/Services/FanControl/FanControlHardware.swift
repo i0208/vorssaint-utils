@@ -106,6 +106,8 @@ final class FanControlHardware {
             return target
         }
 
+        // Keep the target write adjacent to manual mode. The thermal controller
+        // can reclaim automatic mode between a separate verification and target.
         var directSucceeded = true
         for (fan, target) in zip(fans, targets) {
             if !writeManualPair(for: fan, target: target) { directSucceeded = false }
@@ -124,6 +126,9 @@ final class FanControlHardware {
                 _ = restoreAutomatic()
                 throw FanControlHardwareError.operationFailed
             }
+            // A stopped Apple Silicon fan can reject manual mode until the
+            // automatic controller has accepted a protective maximum target.
+            // Apply the requested level only after manual mode sticks.
             for fan in fans {
                 guard setValue(fan.maximumRPM, for: fan.target, attempts: 10) else {
                     _ = restoreAutomatic()
@@ -160,7 +165,6 @@ final class FanControlHardware {
         }
     }
 
-
     func updateCooling(level: Int) throws -> [FanControlFanReading] {
         let fans = try discoverControlledFans()
         guard FanControlPolicy.validCoolingLevel(level) else {
@@ -192,7 +196,6 @@ final class FanControlHardware {
         }
     }
 
-
     func validateAutomaticControl() throws {
         let fans = try discoverControlledFans()
         guard try fans.allSatisfy({ try FanControlPolicy.isAutomaticMode(modeValue($0.mode)) }) else {
@@ -210,11 +213,8 @@ final class FanControlHardware {
     func restoreAutomatic() -> Bool {
         guard let fans = try? discoverControlledFans() else { return false }
         for fan in fans {
+            // Preserve the last safe target if firmware rejects the mode change.
             _ = setMode(0, for: fan, attempts: 20)
-            // The target is ignored in automatic mode. Clear it when the
-            // controller accepts the write, but never mistake a rejected
-            // target reset for a failure to return control to the firmware.
-            _ = setValue(0, for: fan.target, attempts: 10)
         }
         if let forceTest = forceTestKey() {
             _ = setByte(0, for: forceTest, attempts: 20)

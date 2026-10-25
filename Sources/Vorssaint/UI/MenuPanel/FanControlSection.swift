@@ -99,7 +99,9 @@ struct FanControlCardContent: View {
                 fanRows
             }
 
-            temperatureSummary
+            if error != .helperUnavailable, error != .controlFailed {
+                temperatureSummary
+            }
 
             if let message = stateMessage {
                 Text(message)
@@ -148,7 +150,6 @@ struct FanControlCardContent: View {
         }
     }
 
-
     @ViewBuilder
     private var temperatureSummary: some View {
         let readings = snapshot.temperatures ?? []
@@ -180,7 +181,6 @@ struct FanControlCardContent: View {
             .padding(.vertical, 2)
         }
     }
-
 
     private var modePicker: some View {
         Picker(strings.mode, selection: $mode) {
